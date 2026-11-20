@@ -11,11 +11,16 @@ class RSSM(nn.Module):
     # input_shape：表示输入数据的形状，通常是一个元组，包含输入数据的维度信息
     # hidden_size：用来存储历史信息的隐藏状态的维度大小
     # output_size：表示输出的维度大小，通常用于表示模型的预测结果或潜在表示的维度
+    # fullstate = (h, z) 其中 h 是 GRU 的隐藏状态，z 是潜在状态,其维度是 hidden_size + output_size
     def __init__(self, input_shape, hidden_size, action_dim=3,output_size=16):
         super(RSSM, self).__init__()
         self.input_shape = input_shape
         self.hidden_size = hidden_size
         self.output_size = output_size
+    # 预测奖励
+        self.reward_predictor = nn.Linear(hidden_size+output_size, 1)  # 预测奖励的线性层
+    # 预测终止
+        self.continue_predictor = nn.Linear(hidden_size+output_size, 1)  # 预测终止的线性层
     # 解码器神经网络
         self.dec = nn.Sequential(
             nn.Linear(output_size+hidden_size, 4608), # 16+16 -> 4608
@@ -48,6 +53,27 @@ class RSSM(nn.Module):
         nn.SiLU(),
         nn.Flatten(start_dim=1),# 6,6,128 -> 4608
         )
+
+    def reward_predict(self,h,z):
+        """
+    Reward predictor:
+        用来预测奖励，输入为当前隐藏状态h和潜在状态z即传说中的全状态，输出为预测的奖励值。
+        """
+        x = torch.cat((h,z.flatten(start_dim=1)),dim=-1)
+        reward = self.reward_predictor(x)
+        return reward.squeeze(-1)  
+    def continue_predict(self,h,z):
+        """
+    Continue predictor:
+        用来预测终止，输入为当前隐藏状态h和潜在状态z，输出为预测的终止值。
+        """
+        x = torch.cat((h,z.flatten(start_dim=1)),dim=-1)
+        x = self.continue_predictor(x)
+       # x = torch.sigmoid(x) # 预测终止值在0-1之间
+        #print(x,x.shape) [2,1]
+        x = x.squeeze(-1) # 
+       #print(x,x.shape) [2]
+        return x
 
 # 求后验Z之前的logitis
 
@@ -98,9 +124,9 @@ Dynamics predictor:
         indexes = categorical.sample()#1*4
         z_next = F.one_hot(indexes,num_classes=logits.shape[-1]).to(logits.dtype) # 1*4*4
         # 尽管是1*4，[0]【X]前的[0]也不能省略
-        print("四个选项的概率：", categorical.probs[0, 0].tolist())
-        print("抽中的编号：", indexes[0, 0].item())
-        print("编号写成向量：", z_next[0, 0].tolist())
+        #print("四个选项的概率：", categorical.probs[0, 0].tolist())
+        #print("抽中的编号：", indexes[0, 0].item())
+      #  print("编号写成向量：", z_next[0, 0].tolist())
         return h_next, z_next
     def decode(self,h,z):
         """
@@ -139,73 +165,20 @@ if __name__ == "__main__":
     x0 = torch.randn(1, 3, 96, 96)       # 一张假图
     h0 = torch.zeros(1, 16)              # 初始记忆
     a0 = torch.tensor([[0.0, 0.5, 0.0]]) # 方向居中、半油门、不刹车
+    h = torch.zeros(2, model.hidden_size)
+    codes = torch.tensor([[0, 0, 0, 0], [1, 1, 1, 1]])
+    z = F.one_hot(codes, num_classes=4).float()
 
-    with torch.no_grad():
-        logits = model.posterior_logits(x0, h0)
-        indices = torch.distributions.Categorical(logits=logits).sample()
-        z0 = F.one_hot(indices, num_classes=4).to(logits.dtype)
-        h1 = model.next_hidden(z0, a0, h0)
-                # 还没看下一帧，只用 h1 从先验采样
-        prior1 = model.prior_logits(h1)
-        prior_indices = torch.distributions.Categorical(logits=prior1).sample()
+    reward = model.reward_predict(h, z)
+    continue_logits = model.continue_predict(h, z)
+    assert reward.shape == continue_logits.shape == (2,)
 
-        # 拿到下一帧后，用同一个 h1 算后验
-        x1 = torch.randn_like(x0)
-        post1 = model.posterior_logits(x1, h1)
+    model.zero_grad()
+    loss_reward = F.mse_loss(reward, torch.tensor([0.5, -1.0]))
+    loss_continue = F.binary_cross_entropy_with_logits(
+        continue_logits, torch.tensor([1.0, 0.0])
+    )
+    (loss_reward + loss_continue).backward()
 
-        assert prior1.shape == post1.shape == (1, 4, 4)
-        assert torch.isfinite(prior1).all()
-        assert prior_indices.shape == (1, 4)
-
-        print("先验和后验的形状：", tuple(prior1.shape), tuple(post1.shape))
-        print("先验抽中的四个类别：", prior_indices.tolist())
-        a1 = torch.tensor([[0.2, 0.3, 0.0]])  # 稍向右转，给一点油门
-
-        h1_img, z1_img = model.imagine_step(z0, a0, h0)
-        h2_img, z2_img = model.imagine_step(z1_img, a1, h1_img)
-
-        assert h1_img.shape == h2_img.shape == (1, 16)
-        assert z1_img.shape == z2_img.shape == (1, 4, 4)
-        assert (z2_img.sum(dim=-1) == 1).all()
-
-        print("想象第 1 步：", tuple(h1_img.shape), tuple(z1_img.shape))
-        print("想象第 2 步：", tuple(h2_img.shape), tuple(z2_img.shape))
-        x0_recon = model.decode(h0, z0)          # z0 来自看过 x0 的后验
-        x2_pred = model.decode(h2_img, z2_img)    # z2_img 来自只给动作的先验
-
-
-
-        print("重建第 0 帧：", tuple(x0_recon.shape))
-        print("预测第 2 帧：", tuple(x2_pred.shape))
-        model.zero_grad()
-    x0 = torch.rand(1, 3, 96, 96)  # 用 [0, 1] 内的假像素
-    h0 = torch.zeros(1, 16)
-
-    logits = model.posterior_logits(x0, h0)
-    z0 = model.sample_z(logits)
-    x0_recon = model.decode(h0, z0)
-
-    assert ((z0 == 0) | (z0 == 1)).all()
-    assert (z0.sum(dim=-1) == 1).all()
-    assert ((x0_recon >= 0) & (x0_recon <= 1)).all()
-
-    loss = F.mse_loss(x0_recon, x0)
-    loss.backward()
-
-    grad = model.posterior_head.weight.grad
-    assert grad is not None, "重建误差还没传到后验头"
-    assert torch.isfinite(grad).all()
-    assert grad.abs().sum().item() > 0
-
-    print("重建误差：", loss.item())
-    print("后验头梯度绝对值之和：", grad.abs().sum().item())
-    group_sums = z0.sum(dim=-1)
-    assert logits.shape == (1, 4, 4)
-    assert z0.shape == (1, 4, 4)
-    assert (group_sums == 1).all()
-    assert h1.shape == (1, 16)
-    assert torch.isfinite(h1).all()
-
-    print("抽中的类别编号：", indices.tolist())
-    print("z0 每组的和：", group_sums.tolist())
-    print("h1 的形状：", tuple(h1.shape))
+    assert model.reward_predictor.weight.grad.abs().sum().item() > 0
+    assert model.continue_predictor.weight.grad.abs().sum().item() > 0

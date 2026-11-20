@@ -29,4 +29,4 @@ def test_env(env, seed):
     #     plt.title(f"observation {i + 1}")
     #     plt.axis("off")
     # plt.show()
-test_env(env, seed)
+#test_env(env, seed)

@@ -24,6 +24,6 @@ DreamBed/
 
 
 # 一些笔记
-GRL
-
+GRU
+gate 循环网络 
 ![alt text](image.png)
